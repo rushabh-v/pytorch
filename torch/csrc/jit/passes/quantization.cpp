@@ -615,6 +615,19 @@ c10::optional<std::string> findObserverName(Value* v) {
   return c10::nullopt;
 }
 
+c10::QScheme toAffine(c10::QScheme qscheme) {
+  switch (qscheme) {
+    case c10::kPerTensorAffine:
+    case c10::kPerTensorSymmetric:
+      return c10::kPerTensorAffine;
+    case c10::kPerChannelAffine:
+    case c10::kPerChannelSymmetric:
+      return c10::kPerChannelAffine;
+    default:
+      return qscheme;
+  }
+}
+
 class InsertQuantDeQuantHelper {
  public:
   InsertQuantDeQuantHelper() {}
@@ -630,23 +643,41 @@ class InsertQuantDeQuantHelper {
   std::tuple<c10::QScheme, QParamMap> getQSchemeAndQParamMap(
       script::Module& module,
       Node* n);
+  void checkQScheme(Graph* g, c10::QScheme qscheme) {
+    if (qscheme_for_graph_.count(g)) {
+      TORCH_CHECK(toAffine(qscheme_for_graph_.at(g)) == toAffine(qscheme) ||
+
+                  "Quantizing same graph with different types of "
+                  "QSchemes is not supported.\n",
+                  " Expecting:",
+                  c10::toString(qscheme_for_graph_.at(g)),
+                  " Got:",
+                  c10::toString(qscheme));
+    } else {
+      qscheme_for_graph_[g] = qscheme;
+    }
+  }
   c10::optional<script::Module> findChildModuleToQuantize(
       script::Module& module,
       Value* child_instance);
   void collectObserverNodesAndValueToQuantize(script::Module& module, Value*);
-  void removeObservers(script::Module& module);
-  void removeObservers(script::Module& module, Graph* g);
+  void cleanup(script::Module& module);
+  void cleanup(script::Module& module, Graph* g);
   void quantizeTensors(script::Module& module, Graph* g, Value* self);
 
  private:
   // TODO: we don't need to call this for each graph
   std::unordered_map<Graph*, std::vector<std::string>>
       observer_modules_to_remove_;
+  std::unordered_map<Graph*, std::vector<int>> removed_observer_slots_;
   std::unordered_map<Graph*, std::vector<Node*>> nodes_to_destroy_;
   // Map from Graph to observer node, we can use observer node to
   // get the information of original value that's been observed and
   // the quantization parameters
   std::unordered_map<Graph*, std::vector<Node*>> observer_nodes_;
+  // Record qscheme for every graph, this is for checking
+  // each graph is only quantized with one type of QScheme
+  std::unordered_map<Graph*, c10::QScheme> qscheme_for_graph_;
 };
 
 void InsertQuantDeQuantHelper::collectObserverNodesAndValueToQuantize(
@@ -675,16 +706,16 @@ void InsertQuantDeQuantHelper::collectObserverNodesAndValueToQuantize(
   observer_nodes_[g].push_back(observer);
 }
 
-void InsertQuantDeQuantHelper::removeObservers(script::Module& module) {
+void InsertQuantDeQuantHelper::cleanup(script::Module& module) {
   for (auto& method : module.get_methods()) {
-    removeObservers(module, method.graph().get());
+    cleanup(module, method.graph().get());
   }
   for (script::Module m : module.children()) {
-    removeObservers(m);
+    cleanup(m);
   }
 }
 
-void InsertQuantDeQuantHelper::removeObservers(
+void InsertQuantDeQuantHelper::cleanup(
     script::Module& module,
     Graph* g) {
   GRAPH_DUMP("Before Remove Observers:", g);
@@ -697,18 +728,31 @@ void InsertQuantDeQuantHelper::removeObservers(
     }
     nodes_to_destroy_.at(g).clear();
   }
+
+  // If we have seen this graph before, we'll replay the observer
+  // slots removal using the slot index
+  if (removed_observer_slots_.count(g)) {
+    for (auto slot: removed_observer_slots_.at(g)) {
+      module._ivalue()->unsafeRemoveSlot(slot);
+    }
+  }
+
   // Remove observer modules from last one to first one in order to
   // reduce the time complexity, assuming all the observer modules
   // are added after the existing modules, we'll have complexity of
   // O(N) where N is number of observer moduels with this optimization
   if (observer_modules_to_remove_.count(g)) {
-    const auto& observers = observer_modules_to_remove_.at(g);
+    auto& observers = observer_modules_to_remove_.at(g);
     for (int64_t i = observers.size() - 1; i >= 0; --i) {
       auto observer_name = observers[i];
-      module._ivalue()->unsafeRemoveAttr(observer_name);
-      module.type()->unsafeRemoveAttribute(observer_name);
+      GRAPH_DEBUG("Trying to remove: ", observer_name);
+      if (module.type()->hasAttribute(observer_name)) {
+        removed_observer_slots_[g].push_back(module.type()->getAttributeSlot(observer_name));
+        module._ivalue()->unsafeRemoveAttr(observer_name);
+        module.type()->unsafeRemoveAttribute(observer_name);
+      }
     }
-    observer_modules_to_remove_.at(g).clear();
+    observers.clear();
   }
   GRAPH_DUMP("After remove observers :", g);
 }
@@ -723,6 +767,7 @@ void InsertQuantDeQuantHelper::quantizeTensors(
   for (auto* n : observer_nodes_.at(g)) {
     auto* original_value = n->input(1);
     auto tp = getQSchemeAndQParamMap(module, n);
+    checkQScheme(g, std::get<0>(tp));
     auto qparam_map = std::get<1>(tp);
     for (auto& pr : qparam_map) {
       const auto& name = pr.first;
@@ -863,6 +908,24 @@ void InsertQuantDeQuantHelper::run(
 
   script::Method method = module.get_method(method_name);
   auto graph = method.graph();
+
+  // We only need to register new parameters if the graph has
+  // been quantized before
+  // TODO: dedup this part with code in quantizeTensors
+  if (observer_nodes_.count(graph.get())) {
+    for (auto* n : observer_nodes_.at(graph.get())) {
+      auto* original_value = n->input(1);
+      auto tp = getQSchemeAndQParamMap(module, n);
+      checkQScheme(graph.get(), std::get<0>(tp));
+      auto qparam_map = std::get<1>(tp);
+      for (auto& pr : qparam_map) {
+        const auto& name = pr.first;
+        const auto& qparam = pr.second;
+        module._ivalue()->setAttr(original_value->debugName() + name, qparam);
+      }
+    }
+    return;
+  }
 
   // prim::Param nodes do not belong to the graph. Hence the Insert
   // point is the beginning of graph node. This also safe guards against
@@ -1150,7 +1213,7 @@ script::Module InsertQuantDeQuant(
   script::Module module = inplace ? input_module : input_module.clone();
   InsertQuantDeQuantHelper h;
   h.run(module, method_name);
-  h.removeObservers(module);
+  h.cleanup(module);
   return module;
 }
 
